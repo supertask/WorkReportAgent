@@ -1,0 +1,28 @@
+# Video conversion settings
+compression:
+  # Constant Rate Factor (0-51). Lower is better quality, higher is smaller size.
+  # 20: High quality (larger size)
+  # 28: Balanced (Current optimized setting, ~15MB)
+  # 32: Small size (~8.5MB, lower quality)
+  crf: 32
+  
+  # Encoding speed/compression ratio.
+  # Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow.
+  # veryslow provides best compression (smallest file size) but takes longer to encode.
+  preset: "veryslow"
+  
+  # Video codec. 
+  # libx264: Widely supported, good balance.
+  # libx265: Better compression for static scenes, but slower encoding and compatibility vary.
+  codec: "libx264"
+
+timelapse:
+  # Factor to calculate speedup. Speed factor = Input FPS / speed_divisor.
+  # Example: 24fps / 2.0 = 12x speedup.
+  speed_divisor: 2.0
+  
+  # Output FPS control.
+  # "auto": Keeps input video's FPS (Recommended to avoid dropped frames/jitter).
+  # Number (e.g., 30): Forces output to specific FPS.
+  output_fps: "auto"
+

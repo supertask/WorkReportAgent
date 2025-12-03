@@ -3,6 +3,28 @@ import subprocess
 import sys
 import glob
 import json
+import yaml
+
+def load_config():
+    """Load configuration from config.yml."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
+    try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading config.yml: {e}")
+        # Return default values if config fails
+        return {
+            "compression": {
+                "crf": 28,
+                "preset": "veryslow",
+                "codec": "libx264"
+            },
+            "timelapse": {
+                "speed_divisor": 2.0,
+                "output_fps": "auto"
+            }
+        }
 
 def get_video_info(filepath):
     """Get frame rate and bitrate of the video using ffprobe."""
@@ -41,37 +63,50 @@ def get_video_info(filepath):
         print(f"Error getting info for {filepath}: {e}")
         return None, None
 
-def convert_video(input_path, output_path):
+def convert_video(input_path, output_path, config):
     """Convert video to timelapse using ffmpeg."""
     fps, original_bitrate = get_video_info(input_path)
     if fps is None:
         return False
 
-    speed_factor = fps / 2.0
+    # Get settings from config
+    comp = config.get('compression', {})
+    time_cfg = config.get('timelapse', {})
+    
+    crf = comp.get('crf', 28)
+    preset = comp.get('preset', 'veryslow')
+    codec = comp.get('codec', 'libx264')
+    
+    speed_divisor = time_cfg.get('speed_divisor', 2.0)
+    output_fps = time_cfg.get('output_fps', 'auto')
+
+    speed_factor = fps / float(speed_divisor)
+    
+    # Determine FPS for filter
+    if output_fps == "auto":
+        filter_fps = fps
+    else:
+        filter_fps = float(output_fps)
+
     print(f"Processing {os.path.basename(input_path)}")
     print(f"Original FPS: {fps:.2f}, Bitrate: {original_bitrate/1000:.0f}k, Speed Factor: {speed_factor:.2f}x")
+    print(f"Settings: Codec={codec}, CRF={crf}, Preset={preset}, Output FPS={filter_fps:.2f}")
 
-    # Investigate Result:
-    # The input video has a very low bitrate (~200kbps) because it is static (screen recording).
-    # When sped up (e.g., 12x), the temporal redundancy is lost (scenes change instantly).
-    # A low fixed bitrate (e.g., 400-600k) causes severe blocking because the encoder
-    # cannot compress these rapid changes efficiently with such a small budget.
-    # Solution: Use CRF (Constant Rate Factor) to maintain visual quality regardless of motion complexity.
-    # Also, we must set a target output framerate (e.g., original fps). Without this, 'setpts' keeps all input frames
-    # but plays them at x times the speed, resulting in absurd framerates (e.g., 300fps) which players handle poorly
-    # and which waste bitrate on frames the eye cannot see.
-    
     cmd = [
         "ffmpeg",
         "-y",
         "-i", input_path,
-        "-filter:v", f"setpts=PTS/{speed_factor},fps={fps}", # Keep original FPS to avoid dropping/duplicating frames unnecessarily
-        "-c:v", "libx264",
-        "-crf", "28",          # Increase CRF to reduce file size (standard range 18-28, higher is smaller/lower quality)
-        "-preset", "veryslow", # Maximize compression efficiency to reduce file size
+        "-filter:v", f"setpts=PTS/{speed_factor},fps={filter_fps}",
+        "-c:v", codec,
+        "-crf", str(crf),
+        "-preset", preset,
         "-an",
         output_path
     ]
+    
+    # Add tag for H.265 compatibility if needed (Mac/QuickTime friendly)
+    if codec == "libx265":
+        cmd.extend(["-tag:v", "hvc1"])
     
     print(f"Running command: {' '.join(cmd)}")
     
@@ -87,6 +122,8 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     input_dir = os.path.join(base_dir, "input")
     output_dir = os.path.join(base_dir, "output")
+    
+    config = load_config()
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -103,7 +140,7 @@ def main():
     for input_path in input_files:
         filename = os.path.basename(input_path)
         output_path = os.path.join(output_dir, filename)
-        convert_video(input_path, output_path)
+        convert_video(input_path, output_path, config)
 
 if __name__ == "__main__":
     main()
