@@ -1,6 +1,18 @@
 .DS_Store
 *.mp4
 
+
+# Python
+# ================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+
+# Node.js
+# ================================
 # Logs
 logs
 *.log
