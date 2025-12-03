@@ -3,21 +3,31 @@ import os
 import base64
 
 # Modalアプリケーションの定義
-app = modal.App("video-analyzer-qwen")
+app = modal.App("video-analyzer-qwen3")
 
-# イメージの定義: CUDAサポート付きのllama-cpp-pythonをインストール
-# ビルド時間を短縮するため、必要なシステムライブラリも追加
+# イメージの定義
+# Unsloth/Qwen3-VLを動かすための環境構築
+# 最新のtransformersとaccelerate, bitsandbytes (4bit量子化用) を入れる
+# flash-attnビルドのためにCUDA develイメージを使用
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
-    .apt_install("libgl1", "libglib2.0-0", "git", "wget", "cmake", "build-essential")
     .pip_install(
-        "huggingface_hub",
+        "torch",
+        "torchvision",
+        "transformers",
+        "accelerate",
+        "bitsandbytes", 
+        "qwen-vl-utils",
         "opencv-python-headless",
         "numpy",
+        "moviepy",
+        "decord",
+        "ninja", 
+        "packaging",
+        "wheel"
     )
     .run_commands(
-        # GPUサポートを有効にしてllama-cpp-pythonをインストール
-        "CMAKE_ARGS='-DGGML_CUDA=on' pip install llama-cpp-python --no-cache-dir --force-reinstall --upgrade"
+        "pip install flash-attn --no-build-isolation"
     )
 )
 
@@ -26,121 +36,118 @@ model_volume = modal.Volume.from_name("hf-model-cache", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="A100",  # 32Bモデルを快適に動かすためA100に変更
-    volumes={"/root/.cache/huggingface": model_volume}, # キャッシュを永続化
-    timeout=1200 # 20分タイムアウト
+    gpu="A100", # 40GB VRAM。32Bの4bit量子化なら約20GBなので収まるはず
+    volumes={"/root/.cache/huggingface": model_volume},
+    timeout=3600 # ダウンロードに時間がかかるので長めに
 )
-def analyze_video_with_qwen(video_bytes: bytes, prompt: str):
-    import cv2
-    import numpy as np
-    from huggingface_hub import hf_hub_download
-    from llama_cpp import Llama, LlamaChatCompletionHandler
+def analyze_video_with_unsloth_qwen3(video_bytes: bytes, prompt_text: str):
+    import torch
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+    from qwen_vl_utils import process_vision_info
+    import tempfile
 
     print("処理を開始します...")
+    print("GPUメモリ状況を確認中...")
+    print(torch.cuda.get_device_name(0))
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
-    # --- モデルのVRAM要件目安 (Unsloth Dynamic GGUF Q4_K_M + コンテキスト) ---
-    # 1. Qwen3-VL-8B-Thinking
-    #    - モデルサイズ: 約 6 GB
-    #    - 必要VRAM: 8GB〜 (T4, L4, A10G)
-    #    - コスト優先ならこちらを選択
+    # --- モデルの設定 ---
+    # ユーザー指定: unsloth/Qwen3-VL-32B-Thinking
+    # GGUF版はllama.cpp未対応のため、Transformersで4bit量子化して動かす
+    # 注: Qwen3-VLはアーキテクチャ的にはQwen2.5-VLの拡張の可能性があるため、
+    # AutoModelで読み込めるはずですが、クラス指定が必要な場合は修正します。
     
-    # 2. Qwen3-VL-32B-Thinking (現在選択中)
-    #    - モデルサイズ: 約 20 GB
-    #    - 必要VRAM: 24GB (A10G) だとギリギリ。動画解析(長コンテキスト)には 40GB (A100) 推奨。
-    
-    # 3. Qwen3-VL-235B-A22B-Thinking (MoE)
-    #    - モデルサイズ: 約 140 GB (Q4推計)
-    #    - 必要VRAM: 160GB以上 (A100 80GB x 2〜4)
-    #    - Modalでは gpu="A100-80GB:2" などの指定が必要
-    
-    # ユーザー指定: unsloth/Qwen3-VL-32B-Thinking-GGUF
-    repo_id = "unsloth/Qwen3-VL-32B-Thinking-GGUF"
-    filename = "Qwen3-VL-32B-Thinking-Q4_K_M.gguf" 
-    
-    print(f"モデルをロード中: {repo_id}/{filename}")
-    try:
-        model_path = hf_hub_download(repo_id=repo_id, filename=filename)
-    except Exception as e:
-        print(f"モデルのダウンロードに失敗しました: {e}")
-        print("正しいrepo_idとfilenameを指定してください。")
-        return "Model download failed"
+    model_name = "unsloth/Qwen3-VL-32B-Thinking" 
+    # model_name = "unsloth/Qwen3-VL-8B-Thinking" # 動作テスト用
 
-    # Llama-cppの初期化（GPUレイヤーをオフロード）
-    # n_gpu_layers=-1 で全てのレイヤーをGPUに載せる
-    # chat_handler=LlamaChatCompletionHandler() はVisionモデルで必要な場合がある
-    llm = Llama(
-        model_path=model_path,
-        n_gpu_layers=-1, # 全てGPU
-        n_ctx=8192,      # コンテキスト長
-        verbose=True
+    print(f"モデルをロード中: {model_name} (4bit量子化)")
+    
+    # 4bit量子化の設定
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    # --- 動画の前処理 ---
-    # 一時ファイルに保存
-    temp_video_path = "/tmp/temp_video.mp4"
-    with open(temp_video_path, "wb") as f:
-        f.write(video_bytes)
-
-    cap = cv2.VideoCapture(temp_video_path)
-    frames = []
-    frame_interval = 30 # 30フレームごとに1枚取得（約1秒に1枚）
-    count = 0
-    
-    print("動画からフレームを抽出中...")
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if count % frame_interval == 0:
-            # JPEGにエンコードしてbase64化
-            _, buffer = cv2.imencode('.jpg', frame)
-            base64_image = base64.b64encode(buffer).decode('utf-8')
-            frames.append(base64_image)
-        count += 1
-    cap.release()
-    print(f"抽出フレーム数: {len(frames)}")
-
-    # --- 推論の実行 ---
-    # VLMへの入力形式を作成
-    # 注: llama-cpp-pythonのバージョンやモデルによって画像入力の形式が異なります
-    # ここではOpenAI互換のChat Completion API形式を使用します
-    
-    results = []
-    
-    # 各フレームについて処理（まとめて送ることも可能だが、ここでは1枚ずつ解説させる例）
-    for i, img_b64 in enumerate(frames):
-        print(f"フレーム {i+1}/{len(frames)} を解析中...")
+    try:
+        # Qwen3-VLはAutoClassで読み込めるはず
+        from transformers import AutoModelForVision2Seq
         
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text", 
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                    }
-                ]
-            }
-        ]
-
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_name,
+            quantization_config=quantization_config,
+            device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
+        processor = AutoProcessor.from_pretrained(model_name)
+        
+    except Exception as e:
+        print(f"モデルロードエラー: {e}")
+        print("Qwen2.5-VLクラスでのロードを試みます...")
         try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                max_tokens=256,
-                temperature=0.7
+            # Qwen2.5-VLとしてロードを試みる（アーキテクチャが似ている場合）
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map="auto",
+                attn_implementation="flash_attention_2",
             )
-            content = response["choices"][0]["message"]["content"]
-            results.append(f"Frame {i+1}: {content}")
-            print(f"  -> {content[:50]}...")
-        except Exception as e:
-            print(f"推論エラー: {e}")
-            results.append(f"Frame {i+1}: Error - {str(e)}")
+            processor = AutoProcessor.from_pretrained(model_name)
+        except Exception as e2:
+             return f"Fatal Error loading model: {e2}"
 
-    return "\n\n".join(results)
+    # --- 動画の一時保存 ---
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
+        temp_video.write(video_bytes)
+        temp_video_path = temp_video.name
+
+    print("推論を実行中...")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": temp_video_path,
+                    "max_pixels": 360 * 420, # 解像度制限
+                    "fps": 1.0, 
+                },
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+    # 入力の前処理
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(model.device)
+
+    # 生成
+    # Thinkingモデルは思考プロセスを出力するためmax_new_tokensを多めに
+    generated_ids = model.generate(**inputs, max_new_tokens=1024)
+    
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+
+    # 後片付け
+    os.remove(temp_video_path)
+
+    return output_text[0]
 
 
 @app.local_entrypoint()
@@ -155,14 +162,13 @@ def main():
     with open(input_path, "rb") as f:
         video_data = f.read()
 
-    print("Modal上で処理を開始します...")
-    # リモート関数を呼び出し
-    result = analyze_video_with_qwen.remote(
-        video_bytes=video_data, 
-        prompt="この画像の状況を詳しく説明してください。"
-    )
-
-    print("\n=== 解析結果 ===\n")
-    print(result)
-
-
+    print("Modal上で処理を開始します (Unsloth Qwen3-VL 4bit)...")
+    try:
+        result = analyze_video_with_unsloth_qwen3.remote(
+            video_bytes=video_data, 
+            prompt_text="この動画の内容を詳しく説明してください。"
+        )
+        print("\n=== 解析結果 ===\n")
+        print(result)
+    except Exception as e:
+        print(f"\nエラーが発生しました: {e}")
