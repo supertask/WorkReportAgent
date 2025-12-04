@@ -4,7 +4,7 @@ compression:
   # 20: High quality (larger size)
   # 28: Balanced (Current optimized setting, ~15MB)
   # 32: Small size (~8.5MB, lower quality)
-  crf: 28
+  crf: 32
   
   # Encoding speed/compression ratio.
   # Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow.
