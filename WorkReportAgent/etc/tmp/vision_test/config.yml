@@ -1,0 +1,7 @@
+# 将来的にGemini 3.0 Proが利用可能になったら以下のように設定してください
+# model_name: "gemini-3.0-pro"
+model_name: "gemini-2.5-pro"
+fallback_models:
+  - "gemini-1.5-pro"
+  - "gemini-1.5-flash"
+
