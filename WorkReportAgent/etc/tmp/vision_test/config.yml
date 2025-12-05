@@ -5,3 +5,7 @@ fallback_models:
   - "gemini-1.5-pro"
   - "gemini-1.5-flash"
 
+# レポート設定
+report:
+  include_screenshots: true # スクショを含めるか
+  screenshot_dir: "images"  # 画像の保存先ディレクトリ（outputフォルダからの相対パス）
